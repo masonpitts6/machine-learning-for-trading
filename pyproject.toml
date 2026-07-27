@@ -1,0 +1,60 @@
+[project]
+name = "machine-learning-for-trading-notebooks"
+version = "0.1.0"
+description = "Reproducible core notebook environment for Machine Learning for Trading."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "ipykernel>=6.29,<7",
+    "jupyterlab>=4.4,<5",
+    "matplotlib>=3.10,<4",
+    "numpy>=2.2,<3",
+    "openpyxl>=3.1,<4",
+    "pandas>=2.2,<3",
+    "pandas-datareader>=0.10,<0.11",
+    "pyarrow>=19,<24",
+    "requests>=2.32,<3",
+    "scikit-learn>=1.6,<2",
+    "scipy>=1.15,<2",
+    "seaborn>=0.13,<0.14",
+    "statsmodels>=0.14,<0.15",
+    "tables>=3.10,<4",
+    "yfinance>=0.2,<2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.11,<1",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = [
+    ".",
+]
+testpaths = [
+    "tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "*.ipynb",
+    "data",
+    "figures",
+    "installation",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+]

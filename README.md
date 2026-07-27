@@ -1,5 +1,38 @@
 # ML for Trading - 2<sup>nd</sup> Edition
 
+## Quant AI devcontainer environment
+
+This fork includes a locked core notebook environment for use from the parent
+[`quant-ai-devcontainer`](https://github.com/masonpitts6/quant-ai-devcontainer)
+Docker Compose workspace. The environment uses Python 3.11 and lives in the
+Docker-owned path
+`/home/developer/.local/share/uv-project-envs/machine-learning-for-trading`;
+it does not create a host or repo-local virtual environment.
+
+From the parent WSL checkout, create and verify it with:
+
+```bash
+docker compose exec workspace bash /workspace/projects/machine-learning-for-trading/scripts/setup_environment.sh --verify
+```
+
+Start Jupyter Lab from the same Compose service:
+
+```bash
+docker compose exec --workdir /workspace/projects/machine-learning-for-trading workspace env UV_PROJECT_ENVIRONMENT=/home/developer/.local/share/uv-project-envs/machine-learning-for-trading ML4T_DATA_DIR=/workspace/projects/machine-learning-for-trading/data/runtime uv run jupyter lab --no-browser --ip 0.0.0.0 --port 8888
+```
+
+Open `http://127.0.0.1:8888` from Windows. New downloads, caches, models, and
+other generated high-I/O state belong under `data/runtime/`, which the parent
+Compose project mounts from a named Docker volume.
+
+The lock covers Jupyter plus the common numerical, tabular, plotting,
+data-access, and statistical libraries used throughout the book. The original
+project spans specialized and sometimes mutually incompatible backtesting,
+deep-learning, NLP, and reinforcement-learning stacks. Those remain
+chapter-specific environments, consistent with the incremental installation
+guidance below; the core verification does not claim that every historical
+notebook runs unchanged.
+
 This [book](https://www.amazon.com/Machine-Learning-Algorithmic-Trading-alternative/dp/1839217715?pf_rd_r=GZH2XZ35GB3BET09PCCA&pf_rd_p=c5b6893a-24f2-4a59-9d4b-aff5065c90ec&pd_rd_r=91a679c7-f069-4a6e-bdbb-a2b3f548f0c8&pd_rd_w=2B0Q0&pd_rd_wg=GMY5S&ref_=pd_gw_ci_mcx_mr_hp_d) aims to show how ML can add value to algorithmic trading strategies in a practical yet comprehensive way. It covers a broad range of ML techniques from linear regression to deep reinforcement learning and demonstrates how to build, backtest, and evaluate a trading strategy driven by model predictions.  
 
 In four parts with **23 chapters plus an appendix**, it covers on **over 800 pages**:
