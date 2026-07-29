@@ -1,0 +1,369 @@
+"""Sample real registry.db data into test intermediates.
+
+Copies a representative subset from each case study's production registry
+into the test-data repo. This gives insight/synthesis/strategy_analysis
+notebooks real data to work with in CI.
+
+Sampling strategy:
+- Model-side tables (training_runs, prediction_sets, prediction_metrics,
+  fold_metrics): copied in full — small enough.
+- Backtest tables: top N per (family × stage) by Sharpe, plus ALL holdout
+  backtests, plus the COMPLETE cost_sensitivity and risk_overlay set of every
+  prediction those two rules retain. Includes corresponding
+  backtest_fold_metrics.
+
+The last rule matters: strategy-analysis notebooks plan the full declared grid
+for the prediction they select and assert its exact row count, so a partially
+sampled downstream set fails a contract production satisfies.
+
+Usage:
+    uv run python tests/sample_registry_for_tests.py
+    uv run python tests/sample_registry_for_tests.py --output ~/ml4t/test-data/intermediates
+
+Writes to: <--output>/{cs}/run_log/registry.db
+"""
+
+import argparse
+import contextlib
+import shutil
+import sqlite3
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).parent.parent
+CODE_CS_DIR = REPO_ROOT / "case_studies"
+
+TEST_DATA_ROOT = Path.home() / "ml4t" / "test-data"
+DEFAULT_INTERMEDIATES_DIR = TEST_DATA_ROOT / "intermediates"
+
+CASE_STUDY_IDS = [
+    "etfs",
+    "crypto_perps_funding",
+    "nasdaq100_microstructure",
+    "sp500_equity_option_analytics",
+    "us_firm_characteristics",
+    "fx_pairs",
+    "cme_futures",
+    "sp500_options",
+    "us_equities_panel",
+]
+
+# Keep top N backtests per (family, stage) by absolute Sharpe
+TOP_N_PER_GROUP = 3
+
+
+def _copy_rows(src, dst, table: str, rows: list) -> int:
+    """Insert rows into dst table with proper column quoting."""
+    if not rows:
+        return 0
+    cols = [d[0] for d in src.execute(f"SELECT * FROM {table} LIMIT 1").description]
+    quoted = [f'"{c}"' for c in cols]
+    ph = ",".join(["?"] * len(cols))
+    dst.executemany(f"INSERT OR IGNORE INTO {table} ({','.join(quoted)}) VALUES ({ph})", rows)
+    return len(rows)
+
+
+def rejected_output_root(intermediates_dir: Path) -> str | None:
+    """Return why this output root must not be written to, or None.
+
+    Each destination is unlinked before its source is opened, and a production
+    registry.db is 43-180 MB and gitignored, so a run pointed at a case-study tree
+    destroys the results SSOT with nothing to restore it from.
+
+    Two rules. The root may not be, or sit inside, any directory named
+    ``case_studies``: in a worktree ``CODE_CS_DIR`` is the worktree's own tree while
+    the canonical registries are the ones in ~/ml4t/code, so path equality alone
+    would let a run write over them. And no destination may land on a production
+    registry once every symlink along it is followed - the per-agent worktree setup
+    symlinks each case study's ``run_log`` to the canonical one precisely so the
+    results source of truth is shared, which makes a symlinked destination the
+    normal case here rather than an exotic one. Both are checked before anything is
+    created or removed.
+    """
+    resolved = intermediates_dir.resolve()
+    if any(part.name == "case_studies" for part in (resolved, *resolved.parents)):
+        return (
+            f"{resolved} is inside a case_studies tree, where each destination is a "
+            "production registry.db that this script unlinks before reading"
+        )
+    for cs_id in CASE_STUDY_IDS:
+        src_db = (CODE_CS_DIR / cs_id / "run_log" / "registry.db").resolve()
+        dst_db = (resolved / cs_id / "run_log" / "registry.db").resolve()
+        if dst_db == src_db:
+            return f"{resolved} resolves onto the source registry at {src_db}"
+        if any(part.name == "case_studies" for part in dst_db.parents):
+            return (
+                f"{resolved}/{cs_id}/run_log resolves into a case_studies tree "
+                f"({dst_db}), whose registry this script unlinks before reading"
+            )
+    return None
+
+
+def sample_registry(cs_id: str, intermediates_dir: Path = DEFAULT_INTERMEDIATES_DIR) -> dict:
+    """Sample from production registry into test intermediates. Returns stats."""
+    src_db = CODE_CS_DIR / cs_id / "run_log" / "registry.db"
+    if not src_db.exists():
+        return {"status": "SKIP", "reason": "no source registry.db"}
+    if reason := rejected_output_root(intermediates_dir):
+        raise ValueError(
+            f"Refusing to sample {cs_id}: {reason}. Point --output at the test-data "
+            "repo's intermediates/ directory."
+        )
+
+    dst_dir = intermediates_dir / cs_id / "run_log"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst_db = dst_dir / "registry.db"
+
+    # Remove old DB to start fresh. The artifact dirs go too: they are keyed by
+    # backtest_hash, so a re-sample that changes hashes would otherwise leave the
+    # previous generation's directories behind alongside the new ones.
+    dst_db.unlink(missing_ok=True)
+    shutil.rmtree(dst_dir / "backtest", ignore_errors=True)
+
+    src = sqlite3.connect(str(src_db))
+    try:
+        dst = sqlite3.connect(str(dst_db))
+        try:
+            stats = _populate_sample_db(src, dst, dst_db)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+    sampled = stats.pop("sampled_hashes", set())
+    artifacts = _copy_backtest_artifacts(src_db.parent, dst_dir, sampled)
+    stats["backtest_artifact_dirs"] = artifacts["copied"]
+    stats["backtest_artifacts_missing_dir"] = artifacts["missing_dir"]
+    stats["backtest_artifacts_missing_returns"] = artifacts["missing_returns"]
+    return stats
+
+
+def _populate_sample_db(src, dst, dst_db) -> dict:
+    stats: dict = {}
+
+    # 1. Copy schema from source (dump CREATE statements)
+    schema_sql = []
+    for row in src.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL"
+    ).fetchall():
+        schema_sql.append(row[0])
+    for sql in schema_sql:
+        dst.execute(sql)
+
+    # Also copy indexes
+    for row in src.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+    ).fetchall():
+        with contextlib.suppress(sqlite3.OperationalError):
+            dst.execute(row[0])
+
+    # 2. Copy model-side tables in full
+    for table in ["training_runs", "prediction_sets", "prediction_metrics", "fold_metrics"]:
+        rows = src.execute(f"SELECT * FROM {table}").fetchall()
+        n = _copy_rows(src, dst, table, rows)
+        stats[table] = n
+
+    # 3. Sample backtests: top N per (family, stage) by |Sharpe|, plus all holdout
+    # First, get sampled backtest hashes
+    sampled_bt_hashes = set()
+
+    # 3a. Top N per family × stage (validation backtests)
+    top_n_sql = """
+        WITH ranked AS (
+            SELECT
+                b.backtest_hash,
+                b.stage,
+                t.family,
+                bm.sharpe,
+                ROW_NUMBER() OVER (
+                    PARTITION BY b.stage, t.family
+                    ORDER BY ABS(bm.sharpe) DESC
+                ) AS rn
+            FROM backtest_runs b
+            JOIN backtest_metrics bm ON b.backtest_hash = bm.backtest_hash
+            JOIN prediction_sets p ON b.prediction_hash = p.prediction_hash
+            JOIN training_runs t ON p.training_hash = t.training_hash
+            WHERE p.split != 'holdout'
+        )
+        SELECT backtest_hash FROM ranked WHERE rn <= ?
+    """
+    for row in src.execute(top_n_sql, (TOP_N_PER_GROUP,)).fetchall():
+        sampled_bt_hashes.add(row[0])
+
+    # 3b. ALL holdout backtests
+    holdout_sql = """
+        SELECT b.backtest_hash
+        FROM backtest_runs b
+        JOIN prediction_sets p ON b.prediction_hash = p.prediction_hash
+        WHERE p.split = 'holdout'
+    """
+    for row in src.execute(holdout_sql).fetchall():
+        sampled_bt_hashes.add(row[0])
+
+    # 3c. Complete the downstream surface of every prediction sampled so far.
+    #
+    # Top-N-per-(family, stage) slices across predictions, so it can retain a
+    # prediction's signal and allocation rows while keeping only a few of its
+    # cost_sensitivity and risk_overlay rows. A strategy-analysis notebook plans
+    # the FULL declared grid for whichever prediction it selects (all 14 fixed
+    # risk controls, the whole cost grid) and asserts the exact row count, so a
+    # partial set fails a contract the production registry satisfies - the
+    # fixture would be testing its own sampling artifact. Whichever prediction
+    # survives sampling must therefore bring its complete downstream surface.
+    downstream_sql = """
+        SELECT backtest_hash FROM backtest_runs
+        WHERE stage IN ('cost_sensitivity', 'risk_overlay')
+          AND prediction_hash IN (
+              SELECT DISTINCT prediction_hash FROM backtest_runs
+              WHERE backtest_hash IN ({placeholders})
+          )
+    """
+    seed_hashes = list(sampled_bt_hashes)
+    for i in range(0, len(seed_hashes), 500):
+        batch = seed_hashes[i : i + 500]
+        sql = downstream_sql.format(placeholders=",".join(["?"] * len(batch)))
+        for row in src.execute(sql, batch).fetchall():
+            sampled_bt_hashes.add(row[0])
+
+    stats["backtest_runs_sampled"] = len(sampled_bt_hashes)
+    stats["sampled_hashes"] = sampled_bt_hashes
+
+    # 3d. Copy sampled backtest data (runs, metrics, fold_metrics)
+    if sampled_bt_hashes:
+        hash_list = list(sampled_bt_hashes)
+        batch_size = 500
+
+        for table in ["backtest_runs", "backtest_metrics", "backtest_fold_metrics"]:
+            count = 0
+            for i in range(0, len(hash_list), batch_size):
+                batch = hash_list[i : i + batch_size]
+                placeholders = ",".join(["?"] * len(batch))
+                rows = src.execute(
+                    f"SELECT * FROM {table} WHERE backtest_hash IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                count += _copy_rows(src, dst, table, rows)
+            stats[table] = count
+
+    dst.commit()
+
+    stats["file_size_kb"] = dst_db.stat().st_size // 1024
+    stats["status"] = "OK"
+    return stats
+
+
+# Per-backtest artifact files a downstream notebook reads by hash. daily_returns is
+# what paired and cohort uncertainty are computed from; spec.json is the run's own
+# provenance. Anything larger stays out of the fixture.
+_BACKTEST_ARTIFACTS = ("daily_returns.parquet", "spec.json")
+
+
+def _copy_backtest_artifacts(src_run_log: Path, dst_run_log: Path, hashes: set) -> dict:
+    """Copy each sampled backtest's artifact dir next to the sampled rows.
+
+    A registry row whose ``run_log/backtest/<hash>/`` is absent is worse than a
+    missing row: selection still reaches it and the read fails downstream, far from
+    the cause. Nothing in the repo used to place these, so the fixture's rows and its
+    artifact dirs were kept in step by hand and drifted apart whenever the registry
+    was re-sampled alone.
+
+    Returns copied/missing counts. A hash whose source dir or ``daily_returns.parquet``
+    is absent is reported rather than skipped in silence - swallowing it here recreates
+    the same read-fails-far-from-the-cause shape one layer up.
+    """
+    src_bt = src_run_log / "backtest"
+    if not src_bt.is_dir():
+        return {"copied": 0, "missing_dir": len(hashes), "missing_returns": 0}
+    dst_bt = dst_run_log / "backtest"
+    copied = 0
+    missing_dir = 0
+    missing_returns = 0
+    for backtest_hash in hashes:
+        src_dir = src_bt / backtest_hash
+        if not src_dir.is_dir():
+            missing_dir += 1
+            continue
+        dst_dir = dst_bt / backtest_hash
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for name in _BACKTEST_ARTIFACTS:
+            src_file = src_dir / name
+            if src_file.is_file():
+                shutil.copy2(src_file, dst_dir / name)
+            elif name == "daily_returns.parquet":
+                missing_returns += 1
+        copied += 1
+    return {"copied": copied, "missing_dir": missing_dir, "missing_returns": missing_returns}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_INTERMEDIATES_DIR,
+        help=(
+            "Fixture intermediates root to write (the test-data repo's "
+            "intermediates/ directory). Default: ~/ml4t/test-data/intermediates"
+        ),
+    )
+    args = parser.parse_args()
+    intermediates_dir = args.output.expanduser().resolve()
+
+    if reason := rejected_output_root(intermediates_dir):
+        parser.error(
+            f"--output is not usable: {reason}. Point it at the test-data repo's "
+            "intermediates/ directory."
+        )
+
+    print(f"Sampling registries from {CODE_CS_DIR}")
+    print(f"Writing to {intermediates_dir}")
+    print(f"Top {TOP_N_PER_GROUP} backtests per (family × stage) + all holdout\n")
+
+    total_size = 0
+    not_refreshed: list[str] = []
+    for cs_id in CASE_STUDY_IDS:
+        print(f"--- {cs_id} ---")
+        stats = sample_registry(cs_id, intermediates_dir)
+        if stats["status"] != "OK":
+            print(f"  {stats['status']}: {stats.get('reason', '')}")
+            not_refreshed.append(cs_id)
+            continue
+        for table in [
+            "training_runs",
+            "prediction_sets",
+            "prediction_metrics",
+            "fold_metrics",
+            "backtest_runs",
+            "backtest_metrics",
+            "backtest_fold_metrics",
+        ]:
+            print(f"  {table:30s} {stats.get(table, 0):>6}")
+        print(f"  {'backtest artifact dirs':30s} {stats.get('backtest_artifact_dirs', 0):>6}")
+        print(f"  {'file size (KB)':30s} {stats['file_size_kb']:>6}")
+        missing_dir = stats.get("backtest_artifacts_missing_dir", 0)
+        missing_returns = stats.get("backtest_artifacts_missing_returns", 0)
+        if missing_dir or missing_returns:
+            print(
+                f"  WARNING: {missing_dir} sampled hashes have no source artifact dir, "
+                f"{missing_returns} have no daily_returns.parquet - a notebook that "
+                f"selects one of them fails on the read, not on the sample"
+            )
+        total_size += stats["file_size_kb"]
+
+    print(f"\nTotal registry size: {total_size} KB ({total_size / 1024:.1f} MB)")
+
+    if not_refreshed:
+        # A skipped case study leaves whatever registry the destination already
+        # held, so exiting 0 here reports a refresh that did not happen and the
+        # replay-only notebooks then read the previous vintage.
+        print(
+            f"\nERROR: {len(not_refreshed)} of {len(CASE_STUDY_IDS)} registries were not "
+            f"refreshed: {', '.join(not_refreshed)}. Their production registry.db is missing "
+            f"under {CODE_CS_DIR}; the fixture keeps whatever it held before this run."
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
